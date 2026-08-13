@@ -589,18 +589,13 @@ def run_check() -> None:
 
 
 def main() -> None:
-    log(f"Shopify 风控中台已启动，每 {POLL_INTERVAL_MINUTES} 分钟巡检一次")
+    log(f"Shopify 风控中台已启动")
     log(f"数据库: {DB_FILE}")
     log(f"API 版本: {API_VERSION} | 查询条件: {ORDER_QUERY}")
     log(f"并发线程: {MAX_WORKERS} | GAS 批量同步: {'已配置' if GAS_WEBHOOK_URL else '未配置'}")
 
+    # 执行一轮风控巡检后直接结束，交由 GitHub Actions 每 30 分钟定时触发
     run_check()
-
-    schedule.every(POLL_INTERVAL_MINUTES).minutes.do(run_check)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
 
 
 if __name__ == "__main__":
