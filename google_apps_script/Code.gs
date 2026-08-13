@@ -1,24 +1,17 @@
 /**
- * Shopify 风控中台 — Google Sheets 批量接收端
+ * Shopify 风控中台 — Google Sheets 批量接收端（带自动查重防重功能）
  *
  * 部署步骤：
  * 1. 打开 Google 表格，扩展程序 → Apps Script，粘贴本文件
  * 2. 修改下方 SHEET_NAME（工作表名称）
  * 3. 首次运行 setupSheet() 创建表头（只需执行一次）
- * 4. 部署 → 新建部署 → 类型选「网页应用」
+ * 4. 部署 → 管理部署 → 部署新版本（或新建部署）
  *    - 执行身份：我
- *    - 访问权限：任何人（Python 脚本从外部 POST 需要）
+ *    - 访问权限：任何人
  * 5. 复制部署 URL，设为 Python 环境变量 GAS_WEBHOOK_URL
- *
- * Python POST 格式：
- * {
- *   "rows": [
- *     ["店铺名", "domain", "#1001", "HIGH", "ERROR", "2026-...", "原因", "同步时间"]
- *   ]
- * }
  */
 
-const SHEET_NAME = 'risk_orders';
+const SHEET_NAME = '高风险+地址验证问题';
 const API_TOKEN = ''; // 可选：填入密钥后，Python 需在 Header 携带 X-Api-Token
 
 /**
@@ -48,7 +41,7 @@ function setupSheet() {
 }
 
 /**
- * 接收 Python 批量 POST
+ * 接收 Python 批量 POST（已完美集成查重逻辑，防止网络重试导致的数据重复）
  */
 function doPost(e) {
   try {
@@ -76,12 +69,49 @@ function doPost(e) {
     }
 
     const sheet = getOrCreateSheet_();
-    const numRows = rows.length;
-    const numCols = rows[0].length;
+
+    // ----------------------------------------------------
+    // 🔍 查重逻辑：读取表格现有数据，建立「店铺域名_订单号」防重索引
+    // ----------------------------------------------------
+    const existingData = sheet.getDataRange().getValues();
+    const existingKeys = {};
+    for (let i = 1; i < existingData.length; i++) {
+      const domain = String(existingData[i][1] || '').trim();  // 第2列：店铺域名
+      const orderNo = String(existingData[i][2] || '').trim(); // 第3列：订单号
+      if (domain && orderNo) {
+        existingKeys[domain + '_' + orderNo] = true;
+      }
+    }
+
+    // 过滤出真正全新的订单
+    const uniqueRows = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const domain = String(row[1] || '').trim();
+      const orderNo = String(row[2] || '').trim();
+      const key = domain + '_' + orderNo;
+
+      if (!existingKeys[key]) {
+        uniqueRows.push(row);
+        existingKeys[key] = true; // 标记防止单次推送批次内有重复
+      }
+    }
+
+    // 如果全部都是已存在的重复订单，直接跳过，防止多写入
+    if (uniqueRows.length === 0) {
+      return jsonResponse({
+        ok: true,
+        appended: 0,
+        message: 'All orders in this payload already exist in the sheet.',
+      });
+    }
+
+    const numRows = uniqueRows.length;
+    const numCols = uniqueRows[0].length;
 
     // 校验每行列数一致
     for (let i = 0; i < numRows; i++) {
-      if (!Array.isArray(rows[i]) || rows[i].length !== numCols) {
+      if (!Array.isArray(uniqueRows[i]) || uniqueRows[i].length !== numCols) {
         return jsonResponse({
           ok: false,
           error: `Row ${i + 1} has inconsistent column count`,
@@ -90,7 +120,7 @@ function doPost(e) {
     }
 
     const startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, numRows, numCols).setValues(rows);
+    sheet.getRange(startRow, 1, numRows, numCols).setValues(uniqueRows);
 
     return jsonResponse({
       ok: true,
