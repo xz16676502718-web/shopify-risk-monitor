@@ -30,11 +30,7 @@ DB_FILE = BASE_DIR / "orders.db"
 API_VERSION = "2026-07"
 HOURS_BACK = 48
 MAX_WORKERS = 10
-GAS_WEBHOOK_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbyqSmqYTDhHRb5G8M8eoww1gP74NEmL27QDf842yhO0lX93hkXsWCR2OmywzUw6V1LE/exec"
-)
-
+GAS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwZmUawxHNCYP4w3IDchs-ape2pfTf4Ua9XHhqCv94vh8ur4HyGasvUUx-Rhp3qeyxM/exec"
 RISK_PRIORITY = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0, "PENDING": 0}
 
 RISK_MAP_CN = {
