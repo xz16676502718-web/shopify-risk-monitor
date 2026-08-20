@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""多店铺 Shopify 风控中台 — 定时拉取高风险 / 地址异常订单并入库（支持双向标签同步）。"""
+"""多店铺 Shopify 风控中台 — 定时拉取高风险 / 地址异常订单并入库（支持标签与秘钥自动同步）。"""
 
 from __future__ import annotations
 
@@ -305,15 +305,14 @@ def build_reason(risk_level: str, address_status: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets 批量同步
+# Google Sheets 批量同步 (含秘钥动态推送)
 # ---------------------------------------------------------------------------
 
 
 def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
-    if not all_orders_list or not GAS_WEBHOOK_URL:
+    if not GAS_WEBHOOK_URL:
         return
 
-    # 保持原来的默认 UTC 同步时间
     synced_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     rows = []
@@ -333,13 +332,26 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
             tags_str,
         ])
 
-    payload = {"rows": rows}
-    
+    # 动态组装店铺配置打包发送给 GAS
+    stores = load_stores()
+    stores_config = {
+        s["domain"]: {
+            "client_id": s["client_id"],
+            "client_secret": s["client_secret"],
+        }
+        for s in stores
+    }
+
+    payload = {
+        "rows": rows,
+        "stores_config": stores_config,
+    }
+
     for attempt in range(1, 4):
         try:
             resp = requests.post(GAS_WEBHOOK_URL, json=payload, timeout=30, verify=False)
             resp.raise_for_status()
-            log(f"Google Sheets 同步成功，发送 {len(rows)} 条订单数据")
+            log(f"Google Sheets 同步成功，发送 {len(rows)} 条订单数据及店铺配置")
             break
         except requests.RequestException as exc:
             if attempt == 3:
@@ -386,7 +398,7 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
 def run_check() -> None:
     log("===== 开始本轮风控巡检 =====")
     stores = load_stores()
-    
+
     worker_results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(check_store_worker, store) for store in stores]
