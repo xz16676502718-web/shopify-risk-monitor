@@ -11,16 +11,15 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
-import schedule
 import urllib3
 
 # ---------------------------------------------------------------------------
-# 禁用 SSL 警告（避免 verify=False 时控制台打印大量警告信息）
+# 禁用 SSL 警告
 # ---------------------------------------------------------------------------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -32,8 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STORES_FILE = BASE_DIR / "stores.json"
 DB_FILE = BASE_DIR / "orders.db"
 API_VERSION = "2026-07"
-ORDER_QUERY = "updated_at:>-24h"
-POLL_INTERVAL_MINUTES = 5
+HOURS_BACK = 48  # 回溯时间（小时），建议保持 48 小时防止漏单
 MAX_WORKERS = 10
 DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
 GAS_WEBHOOK_URL = (
@@ -52,13 +50,18 @@ RISK_MAP_CN = {
     "PENDING": "待评估",
 }
 
-# 地址校验结果中文映射
+# 地址校验结果中文映射（包含 Shopify 官方 API 所有的异常枚举值）
 ADDR_MAP_CN = {
     "NO_ISSUES": "无异常",
+    "VALIDATED": "无异常",
     "WARNING": "地址警告",
     "ERROR": "地址错误",
+    "INCOMPLETE": "地址不完整",
+    "UNVERIFIED": "未验证地址",
+    "CORRECTED": "地址已修正",
 }
 
+# 增加提取 order.riskLevel 字段
 ORDERS_GQL = """
 query RecentOrders($query: String!, $cursor: String) {
   orders(first: 50, query: $query, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
@@ -71,6 +74,7 @@ query RecentOrders($query: String!, $cursor: String) {
         name
         createdAt
         updatedAt
+        riskLevel
         risk {
           assessments {
             riskLevel
@@ -98,9 +102,14 @@ logger = logging.getLogger(__name__)
 
 
 def log(msg: str) -> None:
-    """带时间戳的日志输出，例如 [10:00:00] 开始检查店铺A..."""
     ts = datetime.now().strftime("%H:%M:%S")
     logger.info("[%s] %s", ts, msg)
+
+
+def build_shopify_query(hours: int = HOURS_BACK) -> str:
+    """生成 Shopify GraphQL 兼容的 ISO 时间查询字符串"""
+    time_threshold = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"updated_at:>{time_threshold}"
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +173,7 @@ def upsert_risk_order(
 
 
 # ---------------------------------------------------------------------------
-# 店铺配置 & OAuth Token 缓存（线程安全）
+# 店铺配置 & OAuth Token 缓存
 # ---------------------------------------------------------------------------
 
 _token_cache: dict[str, dict[str, float | str]] = {}
@@ -190,9 +199,7 @@ def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
         client_id = str(item.get("client_id", "")).strip()
         client_secret = str(item.get("client_secret", "")).strip()
         if not domain or not client_id or not client_secret:
-            raise ValueError(
-                f"stores.json 第 {idx} 项缺少 domain / client_id / client_secret"
-            )
+            raise ValueError(f"stores.json 第 {idx} 项缺少 domain / client_id / client_secret")
         stores.append(
             {
                 "name": name,
@@ -205,10 +212,9 @@ def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
 
 
 def fetch_access_token(domain: str, client_id: str, client_secret: str) -> str:
-    """使用 Client Credentials 换取 Access Token（自带 3 次自动重试与 SSL 忽略）。"""
     url = f"https://{domain}/admin/oauth/access_token"
     max_retries = 3
-    
+
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.post(
@@ -220,7 +226,7 @@ def fetch_access_token(domain: str, client_id: str, client_secret: str) -> str:
                     "client_secret": client_secret,
                 },
                 timeout=30,
-                verify=False,  # 👈 防止代理或 SSL 拦截导致的报错
+                verify=False,
             )
             response.raise_for_status()
             body = response.json()
@@ -243,7 +249,6 @@ def fetch_access_token(domain: str, client_id: str, client_secret: str) -> str:
 
 
 def get_access_token(store: dict[str, str]) -> str:
-    """获取有效 Access Token，过期前 60 秒自动刷新。"""
     domain = store["domain"]
     with _token_lock:
         cached = _token_cache.get(domain)
@@ -265,7 +270,6 @@ def shopify_graphql(
     variables: dict[str, Any] | None = None,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """Shopify GraphQL 请求（自带 3 次自动重试与 SSL 忽略）。"""
     url = f"https://{domain}/admin/api/{API_VERSION}/graphql.json"
     headers = {
         "Content-Type": "application/json",
@@ -278,9 +282,7 @@ def shopify_graphql(
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=timeout, verify=False
-            )
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout, verify=False)
             response.raise_for_status()
             body = response.json()
             if body.get("errors"):
@@ -288,16 +290,21 @@ def shopify_graphql(
             return body.get("data") or {}
         except requests.RequestException as exc:
             if attempt < max_retries:
-                time.sleep(2)  # 等待 2 秒后重试
+                time.sleep(2)
             else:
                 raise exc
 
 
-def highest_risk_level(assessments: list[dict[str, Any]] | None) -> str:
-    if not assessments:
-        return "NONE"
-    best = "NONE"
-    best_score = -1
+def highest_risk_level(node: dict[str, Any]) -> str:
+    """同时兼顾订单根字段 riskLevel 与 risk.assessments 评估结果"""
+    direct_level = str(node.get("riskLevel") or "NONE").upper()
+
+    risk = node.get("risk") or {}
+    assessments = risk.get("assessments") or []
+
+    best = direct_level
+    best_score = RISK_PRIORITY.get(best, 0)
+
     for item in assessments:
         level = str(item.get("riskLevel") or "NONE").upper()
         score = RISK_PRIORITY.get(level, 0)
@@ -308,18 +315,15 @@ def highest_risk_level(assessments: list[dict[str, Any]] | None) -> str:
 
 
 def evaluate_order(node: dict[str, Any]) -> tuple[bool, str, str]:
-    """
-    判断订单是否需要入库。
-    返回: (是否命中, risk_level, address_status)
-    """
-    risk = node.get("risk") or {}
-    risk_level = highest_risk_level(risk.get("assessments"))
+    """判断订单是否包含高风险或地址异常"""
+    risk_level = highest_risk_level(node)
 
     shipping = node.get("shippingAddress") or {}
     address_status = str(shipping.get("validationResultSummary") or "").upper()
 
     hit_risk = risk_level == "HIGH"
-    hit_address = address_status in {"ERROR", "WARNING"}
+    # 包含了 Shopify 针对地址异常返回的所有可能状态码（如 INCOMPLETE, UNVERIFIED, ERROR, WARNING）
+    hit_address = address_status in {"ERROR", "WARNING", "INCOMPLETE", "UNVERIFIED"}
 
     if hit_risk or hit_address:
         return True, risk_level, address_status
@@ -329,9 +333,10 @@ def evaluate_order(node: dict[str, Any]) -> tuple[bool, str, str]:
 def fetch_recent_orders(domain: str, token: str) -> list[dict[str, Any]]:
     orders: list[dict[str, Any]] = []
     cursor: str | None = None
+    query_str = build_shopify_query(HOURS_BACK)
 
     while True:
-        variables = {"query": ORDER_QUERY, "cursor": cursor}
+        variables = {"query": query_str, "cursor": cursor}
         data = shopify_graphql(domain, token, ORDERS_GQL, variables)
 
         orders_conn = data.get("orders") or {}
@@ -351,25 +356,20 @@ def fetch_recent_orders(domain: str, token: str) -> list[dict[str, Any]]:
 
 
 def build_reason(risk_level: str, address_status: str) -> str:
-    """生成中文命中原因"""
     reasons: list[str] = []
     if risk_level == "HIGH":
         reasons.append("高风险")
-    if address_status in {"ERROR", "WARNING"}:
+    if address_status in {"ERROR", "WARNING", "INCOMPLETE", "UNVERIFIED"}:
         reasons.append(ADDR_MAP_CN.get(address_status, address_status))
     return ", ".join(reasons)
 
 
 # ---------------------------------------------------------------------------
-# 钉钉告警（预留）
+# 钉钉告警
 # ---------------------------------------------------------------------------
 
 
 def send_alert(shop: str, order_name: str, reason: str) -> None:
-    """
-    发送钉钉 Webhook 告警。
-    设置环境变量 DINGTALK_WEBHOOK 后才会真正发送；未配置时仅打印日志。
-    """
     text = f"[Shopify风控] 店铺: {shop} | 订单: {order_name} | 原因: {reason}"
 
     if not DINGTALK_WEBHOOK:
@@ -389,14 +389,11 @@ def send_alert(shop: str, order_name: str, reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets 批量同步（自动转换为中文 + 格式化时间 + 重试）
+# Google Sheets 批量同步
 # ---------------------------------------------------------------------------
 
 
 def sync_to_google_sheets(new_orders_list: list[dict[str, str]]) -> None:
-    """
-    将本轮所有新发现的异常订单，通过 1 次 HTTP POST 批量写入 Google Sheets。
-    """
     if not new_orders_list:
         return
 
@@ -450,58 +447,26 @@ def sync_to_google_sheets(new_orders_list: list[dict[str, str]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 核心业务（并发查询，主线程入库）
+# 核心业务
 # ---------------------------------------------------------------------------
 
 
 def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
-    """
-    单店铺并发 worker：只做 Token 获取 + GraphQL 查询，不写数据库。
-    返回 flagged 订单列表；出错时 error 字段有值。
-    """
     name = store["name"]
     domain = store["domain"]
     log(f"开始检查店铺 {name} ({domain})...")
 
     try:
         token = get_access_token(store)
-    except requests.Timeout:
-        log(f"店铺 {name} 获取 Token 超时，已跳过")
-        return {"store": store, "orders": [], "error": "token_timeout"}
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response else "未知"
-        detail = ""
-        if exc.response is not None:
-            try:
-                detail = exc.response.json().get("error_description") or exc.response.text[:200]
-            except Exception:  # noqa: BLE001
-                detail = exc.response.text[:200]
-        log(f"店铺 {name} 获取 Token 失败 (HTTP {status}): {detail}，已跳过")
-        return {"store": store, "orders": [], "error": f"token_http_{status}"}
-    except requests.RequestException as exc:
-        log(f"店铺 {name} 获取 Token 网络错误: {exc}，已跳过")
-        return {"store": store, "orders": [], "error": "token_network"}
-    except RuntimeError as exc:
+    except Exception as exc:
         log(f"店铺 {name} 获取 Token 失败: {exc}，已跳过")
-        return {"store": store, "orders": [], "error": "token_runtime"}
+        return {"store": store, "orders": [], "error": "token_error"}
 
     try:
         raw_orders = fetch_recent_orders(domain, token)
-    except requests.Timeout:
-        log(f"店铺 {name} API 超时，已跳过")
-        return {"store": store, "orders": [], "error": "api_timeout"}
-    except requests.HTTPError as exc:
-        log(f"店铺 {name} HTTP 错误 ({exc.response.status_code if exc.response else '未知'})，已跳过")
-        return {"store": store, "orders": [], "error": "api_http"}
-    except requests.RequestException as exc:
-        log(f"店铺 {name} 网络错误: {exc}，已跳过")
-        return {"store": store, "orders": [], "error": "api_network"}
-    except RuntimeError as exc:
-        log(f"店铺 {name} GraphQL 返回错误: {exc}，已跳过")
-        return {"store": store, "orders": [], "error": "api_graphql"}
-    except Exception as exc:  # noqa: BLE001
-        log(f"店铺 {name} 未知异常: {exc}，已跳过")
-        return {"store": store, "orders": [], "error": "unknown"}
+    except Exception as exc:
+        log(f"店铺 {name} API 获取失败: {exc}，已跳过")
+        return {"store": store, "orders": [], "error": "api_error"}
 
     flagged_orders: list[dict[str, str]] = []
     for order in raw_orders:
@@ -549,7 +514,7 @@ def run_check() -> None:
         for future in as_completed(futures):
             try:
                 worker_results.append(future.result())
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log(f"并发任务异常: {exc}")
 
     conn = init_db()
@@ -589,12 +554,11 @@ def run_check() -> None:
 
 
 def main() -> None:
-    log(f"Shopify 风控中台已启动")
+    log("Shopify 风控中台已启动")
     log(f"数据库: {DB_FILE}")
-    log(f"API 版本: {API_VERSION} | 查询条件: {ORDER_QUERY}")
+    log(f"API 版本: {API_VERSION} | 动态查询窗口: 过去 {HOURS_BACK} 小时")
     log(f"并发线程: {MAX_WORKERS} | GAS 批量同步: {'已配置' if GAS_WEBHOOK_URL else '未配置'}")
 
-    # 执行一轮风控巡检后直接结束，交由 GitHub Actions 每 30 分钟定时触发
     run_check()
 
 
