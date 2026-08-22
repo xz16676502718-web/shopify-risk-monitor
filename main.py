@@ -305,6 +305,11 @@ def build_reason(risk_level: str, address_status: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Google Sheets 批量同步
+# ---------------------------------------------------------------------------
+
+
 def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
     if not GAS_WEBHOOK_URL:
         return
@@ -312,6 +317,7 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
     synced_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     rows = []
+
     for item in all_orders_list:
         created_at_utc = format_utc_time(item["created_at"])
         tags_str = ", ".join(item.get("tags") or [])
@@ -328,19 +334,44 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
             tags_str,
         ])
 
-payload = {
-    "rows": rows,
-}
+    payload = {
+        "rows": rows,
+    }
+
+    # ----------------------------------------------------
+    # 发送到 Google Apps Script
+    # ----------------------------------------------------
 
     for attempt in range(1, 4):
         try:
-            resp = requests.post(GAS_WEBHOOK_URL, json=payload, timeout=30, verify=False)
+            resp = requests.post(
+                GAS_WEBHOOK_URL,
+                json=payload,
+                timeout=30,
+                verify=False,
+            )
+
             resp.raise_for_status()
-            log(f"Google Sheets 同步成功，发送 {len(rows)} 条订单数据")
+
+            log(
+                f"Google Sheets 同步成功，"
+                f"发送 {len(rows)} 条订单数据"
+            )
+
             break
+
         except requests.RequestException as exc:
-            if attempt == 3:
-                log(f"Google Sheets 批量同步失败: {exc}")
+            if attempt < 3:
+                log(
+                    f"Google Sheets 同步失败，第 {attempt} 次，"
+                    f"2 秒后重试：{exc}"
+                )
+                time.sleep(2)
+            else:
+                log(
+                    f"Google Sheets 批量同步失败，"
+                    f"已重试 3 次：{exc}"
+                )
 
 
 # ---------------------------------------------------------------------------
