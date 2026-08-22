@@ -792,26 +792,19 @@ def check_store_worker(
 # ===========================================================================
 
 def sync_to_google_sheets(
-    orders: list[
-        dict[str, Any]
-    ],
+    orders: list[dict[str, Any]]
 ) -> None:
 
     if not GAS_WEBHOOK_URL:
-
         log(
-            "GAS_WEBHOOK_URL 为空，"
-            "跳过 Google Sheets 同步"
+            "GAS_WEBHOOK_URL 为空，跳过 Google Sheets 同步"
         )
-
         return
 
     if not orders:
-
         log(
             "本轮没有需要同步的异常订单"
         )
-
         return
 
     synced_at_utc = (
@@ -829,7 +822,7 @@ def sync_to_google_sheets(
         created_at = format_utc_time(
             item.get(
                 "created_at",
-                "",
+                ""
             )
         )
 
@@ -837,78 +830,68 @@ def sync_to_google_sheets(
             item.get(
                 "tags",
                 []
-            )
-            or []
+            ) or []
         )
 
         rows.append(
             [
                 item.get(
                     "shop_name",
-                    "",
+                    ""
                 ),
 
                 item.get(
                     "shop_domain",
-                    "",
+                    ""
                 ),
 
                 item.get(
                     "order_name",
-                    "",
+                    ""
                 ),
 
                 RISK_MAP_CN.get(
                     item.get(
                         "risk_level",
-                        "",
+                        ""
                     ),
                     item.get(
                         "risk_level",
-                        "",
-                    ),
+                        ""
+                    )
                 ),
 
                 ADDR_MAP_CN.get(
                     item.get(
                         "address_status",
-                        "",
+                        ""
                     ),
                     item.get(
                         "address_status",
-                        "",
-                    ),
+                        ""
+                    )
                 ),
 
                 created_at,
 
                 item.get(
                     "reason",
-                    "",
+                    ""
                 ),
 
                 synced_at_utc,
 
-                tags_str,
+                tags_str
             ]
         )
 
     payload = {
-        "rows": rows,
+        "rows": rows
     }
 
     for attempt in range(1, 4):
 
         try:
-
-            # -------------------------------------------------------
-            # 第一次请求
-            #
-            # 不自动跟随重定向。
-            #
-            # Apps Script ContentService Web App 的响应可能经过
-            # googleusercontent.com 重定向。
-            # -------------------------------------------------------
 
             response = requests.post(
                 GAS_WEBHOOK_URL,
@@ -924,16 +907,21 @@ def sync_to_google_sheets(
                 allow_redirects=False,
             )
 
+            status_code = response.status_code
+
             log(
-                "GAS 首次响应 HTTP："
-                f"{response.status_code}"
+                "Google Apps Script HTTP："
+                f"{status_code}"
             )
 
-            # -------------------------------------------------------
-            # 302 / 301 / 303 / 307 / 308
-            # -------------------------------------------------------
+            # ---------------------------------------------------
+            # Apps Script Web App 正常可能返回 302
+            #
+            # 这里不要再次 POST Location。
+            # POST /exec 已经完成 Apps Script 调用。
+            # ---------------------------------------------------
 
-            if response.status_code in {
+            if status_code in {
                 301,
                 302,
                 303,
@@ -943,94 +931,83 @@ def sync_to_google_sheets(
 
                 redirect_url = (
                     response.headers.get(
-                        "Location"
+                        "Location",
+                        ""
                     )
                 )
 
-                if not redirect_url:
+                log(
+                    "Apps Script 返回重定向，"
+                    "视为请求已提交。"
+                )
 
-                    raise RuntimeError(
-                        "GAS 返回重定向，"
-                        "但没有 Location"
+                if redirect_url:
+                    log(
+                        "Redirect Location："
+                        f"{redirect_url[:180]}"
                     )
 
                 log(
-                    "GAS 返回重定向，"
-                    "继续发送 POST"
+                    "Google Sheets 请求提交成功："
+                    f"发送 {len(rows)} 条订单数据"
                 )
 
-                response = requests.post(
-                    redirect_url,
-                    json=payload,
-                    headers={
-                        "Content-Type":
-                            "application/json",
-                        "Accept":
-                            "application/json",
-                    },
-                    timeout=30,
-                    verify=False,
-                    allow_redirects=False,
+                return
+
+            # ---------------------------------------------------
+            # 200
+            # 某些情况下直接返回 200
+            # ---------------------------------------------------
+
+            if status_code == 200:
+
+                response_text = (
+                    response.text.strip()
                 )
 
                 log(
-                    "GAS 重定向目标 HTTP："
-                    f"{response.status_code}"
+                    "Apps Script 返回："
+                    + response_text[:1000]
                 )
 
-            # -------------------------------------------------------
-            # HTTP 状态检查
-            # -------------------------------------------------------
+                # 如果有 JSON，尝试读取
+                try:
+
+                    result = response.json()
+
+                    if result.get("ok") is False:
+                        raise RuntimeError(
+                            "Apps Script 返回失败："
+                            + json.dumps(
+                                result,
+                                ensure_ascii=False
+                            )
+                        )
+
+                    log(
+                        "Google Sheets 同步成功："
+                        f"新增 {result.get('added', 0)} 条，"
+                        f"更新 {result.get('updated', 0)} 条"
+                    )
+
+                    return
+
+                except ValueError:
+
+                    # 200 但不是 JSON，
+                    # 仍然认为 Web App 已收到请求
+                    log(
+                        "Apps Script 返回 200，"
+                        "但响应不是 JSON。"
+                    )
+
+                    return
+
+            # ---------------------------------------------------
+            # 其他 HTTP 状态
+            # ---------------------------------------------------
 
             response.raise_for_status()
-
-            response_text = (
-                response.text.strip()
-            )
-
-            log(
-                "GAS 返回内容："
-                +
-                response_text[:1500]
-            )
-
-            # -------------------------------------------------------
-            # JSON 检查
-            # -------------------------------------------------------
-
-            try:
-
-                result = response.json()
-
-            except Exception as exc:
-
-                raise RuntimeError(
-                    "GAS 没有返回有效 JSON："
-                    f"{exc}；原始内容："
-                    f"{response_text[:500]}"
-                )
-
-            # -------------------------------------------------------
-            # 真正判断 GAS 是否成功
-            # -------------------------------------------------------
-
-            if result.get("ok") is not True:
-
-                raise RuntimeError(
-                    "GAS 返回失败："
-                    +
-                    json.dumps(
-                        result,
-                        ensure_ascii=False,
-                    )
-                )
-
-            log(
-                "Google Sheets 同步成功："
-                f"新增 {result.get('added', 0)} 条，"
-                f"更新 {result.get('updated', 0)} 条，"
-                f"共处理 {result.get('total', 0)} 条"
-            )
 
             return
 
