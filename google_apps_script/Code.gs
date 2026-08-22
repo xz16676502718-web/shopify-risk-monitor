@@ -33,6 +33,7 @@ function setupSheet() {
     '订单创建时间',
     '命中原因',
     '同步时间',
+    '订单标签',
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
