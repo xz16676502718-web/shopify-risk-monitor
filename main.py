@@ -328,26 +328,15 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
             tags_str,
         ])
 
-    # 动态组装店铺配置打包发送给 GAS
-    stores = load_stores()
-    stores_config = {
-        s["domain"]: {
-            "client_id": s["client_id"],
-            "client_secret": s["client_secret"],
-        }
-        for s in stores
-    }
-
-    payload = {
-        "rows": rows,
-        "stores_config": stores_config,
-    }
+payload = {
+    "rows": rows,
+}
 
     for attempt in range(1, 4):
         try:
             resp = requests.post(GAS_WEBHOOK_URL, json=payload, timeout=30, verify=False)
             resp.raise_for_status()
-            log(f"Google Sheets 同步成功，发送 {len(rows)} 条订单数据及店铺配置")
+            log(f"Google Sheets 同步成功，发送 {len(rows)} 条订单数据")
             break
         except requests.RequestException as exc:
             if attempt == 3:
