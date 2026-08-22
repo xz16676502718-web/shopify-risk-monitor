@@ -4,20 +4,21 @@
 
 功能：
 1. 多店铺并发巡检
-2. 检查最近 48 小时有更新的订单
-3. 监控风险等级
-4. 监控地址校验状态
-5. 记录订单历史状态
-6. 状态发生变化时同步 Google Sheets
-7. 新订单自动新增
-8. 已存在订单由 Google Sheets 接收端更新原行
+2. 查询最近 48 小时有更新的订单
+3. 检查订单风险等级
+4. 检查地址验证状态
+5. 收集标签
+6. 同步到 Google Sheets
+7. 新订单新增
+8. 已存在订单由 GAS 更新原行
+9. 严格检查 GAS 实际返回结果
+10. 输出详细同步日志
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import sys
 import threading
 import time
@@ -31,7 +32,13 @@ import requests
 import urllib3
 
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ===========================================================================
+# HTTPS
+# ===========================================================================
+
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
 
 
 # ===========================================================================
@@ -41,17 +48,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_DIR = Path(__file__).resolve().parent
 
 STORES_FILE = BASE_DIR / "stores.json"
-DB_FILE = BASE_DIR / "orders.db"
 
 API_VERSION = "2026-07"
 
-# 检查最近多少小时发生过更新的订单
+# 查询最近多少小时有更新的订单
 HOURS_BACK = 48
 
-# 同时检查多少个店铺
+# 最大并发店铺数
 MAX_WORKERS = 10
 
-# Google Apps Script Webhook
+# Google Apps Script Web App
 GAS_WEBHOOK_URL = (
     "https://script.google.com/macros/s/"
     "AKfycbwZmUawxHNCYP4w3IDchs-ape2pfTf4Ua9XHhqCv94vh8ur4HyGasvUUx-Rhp3qeyxM"
@@ -142,17 +148,19 @@ query RecentOrders($query: String!, $cursor: String) {
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ],
 )
 
 logger = logging.getLogger(__name__)
 
 
-def log(msg: str) -> None:
+def log(message: str) -> None:
     logger.info(
         "[%s] %s",
         datetime.now(timezone.utc).strftime("%H:%M:%S"),
-        msg,
+        message,
     )
 
 
@@ -160,23 +168,23 @@ def log(msg: str) -> None:
 # 时间
 # ===========================================================================
 
-def build_shopify_query(hours: int = HOURS_BACK) -> str:
-    """
-    查询最近 N 小时有更新的订单。
-    """
+def build_shopify_query(
+    hours: int = HOURS_BACK,
+) -> str:
 
-    time_threshold = (
+    threshold = (
         datetime.now(timezone.utc)
         - timedelta(hours=hours)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
-    return f"updated_at:>{time_threshold}"
+    return f"updated_at:>{threshold}"
 
 
-def format_utc_time(iso_str: str) -> str:
-    """
-    格式化 Shopify UTC 时间。
-    """
+def format_utc_time(
+    iso_str: str,
+) -> str:
 
     if not iso_str:
         return ""
@@ -190,140 +198,24 @@ def format_utc_time(iso_str: str) -> str:
 
 
 # ===========================================================================
-# SQLite 数据库
+# Token 缓存
 # ===========================================================================
 
-def init_db(db_path: Path = DB_FILE) -> sqlite3.Connection:
-    """
-    初始化订单状态数据库。
-    """
-
-    conn = sqlite3.connect(
-        db_path,
-        check_same_thread=False,
-    )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS risk_orders (
-            shop_domain    TEXT NOT NULL,
-            order_name     TEXT NOT NULL,
-            risk_level     TEXT NOT NULL DEFAULT '',
-            address_status TEXT NOT NULL DEFAULT '',
-            created_at     TEXT NOT NULL DEFAULT '',
-            updated_at     REAL NOT NULL,
-            PRIMARY KEY (shop_domain, order_name)
-        )
-        """
-    )
-
-    conn.commit()
-
-    return conn
-
-
-def get_previous_order_state(
-    conn: sqlite3.Connection,
-    shop_domain: str,
-    order_name: str,
-) -> dict[str, str] | None:
-    """
-    获取订单上一次保存的状态。
-    """
-
-    cursor = conn.execute(
-        """
-        SELECT
-            risk_level,
-            address_status,
-            created_at
-        FROM risk_orders
-        WHERE shop_domain = ?
-          AND order_name = ?
-        """,
-        (
-            shop_domain,
-            order_name,
-        ),
-    )
-
-    row = cursor.fetchone()
-
-    if not row:
-        return None
-
-    return {
-        "risk_level": str(row[0] or ""),
-        "address_status": str(row[1] or ""),
-        "created_at": str(row[2] or ""),
-    }
-
-
-def upsert_risk_order(
-    conn: sqlite3.Connection,
-    shop_domain: str,
-    order_name: str,
-    risk_level: str,
-    address_status: str,
-    created_at: str,
-    *,
-    commit: bool = True,
-) -> None:
-    """
-    保存订单当前状态。
-    """
-
-    now_ts = time.time()
-
-    conn.execute(
-        """
-        INSERT INTO risk_orders
-            (
-                shop_domain,
-                order_name,
-                risk_level,
-                address_status,
-                created_at,
-                updated_at
-            )
-        VALUES (?, ?, ?, ?, ?, ?)
-
-        ON CONFLICT(shop_domain, order_name)
-        DO UPDATE SET
-            risk_level     = excluded.risk_level,
-            address_status = excluded.address_status,
-            created_at     = excluded.created_at,
-            updated_at     = excluded.updated_at
-        """,
-        (
-            shop_domain,
-            order_name,
-            risk_level,
-            address_status,
-            created_at,
-            now_ts,
-        ),
-    )
-
-    if commit:
-        conn.commit()
-
-
-# ===========================================================================
-# Shopify Token
-# ===========================================================================
-
-_token_cache: dict[str, dict[str, float | str]] = {}
+_token_cache: dict[
+    str,
+    dict[str, float | str]
+] = {}
 
 _token_lock = threading.Lock()
 
 
+# ===========================================================================
+# 店铺配置
+# ===========================================================================
+
 def load_stores(
     stores_path: Path = STORES_FILE,
 ) -> list[dict[str, str]]:
-    """
-    读取 stores.json。
-    """
 
     if not stores_path.exists():
         raise FileNotFoundError(
@@ -332,12 +224,13 @@ def load_stores(
 
     with stores_path.open(
         encoding="utf-8"
-    ) as f:
-        data = json.load(f)
+    ) as file:
+
+        data = json.load(file)
 
     stores: list[dict[str, str]] = []
 
-    for idx, item in enumerate(
+    for index, item in enumerate(
         data,
         start=1,
     ):
@@ -345,7 +238,7 @@ def load_stores(
         name = (
             str(item.get("name", ""))
             .strip()
-            or f"店铺{idx}"
+            or f"店铺{index}"
         )
 
         domain = (
@@ -375,6 +268,10 @@ def load_stores(
     return stores
 
 
+# ===========================================================================
+# Shopify Access Token
+# ===========================================================================
+
 def fetch_access_token(
     domain: str,
     client_id: str,
@@ -394,7 +291,7 @@ def fetch_access_token(
                 url,
                 headers={
                     "Content-Type":
-                        "application/x-www-form-urlencoded"
+                        "application/x-www-form-urlencoded",
                 },
                 data={
                     "grant_type":
@@ -412,40 +309,45 @@ def fetch_access_token(
 
             body = response.json()
 
-            access_token = body.get(
+            token = body.get(
                 "access_token"
             )
 
-            if not access_token:
+            if not token:
                 raise RuntimeError(
-                    "Shopify 没有返回 access_token"
+                    "Shopify 没有返回 Access Token"
                 )
 
             expires_in = int(
-                body.get("expires_in")
+                body.get(
+                    "expires_in"
+                )
                 or 86399
             )
 
             with _token_lock:
 
                 _token_cache[domain] = {
-                    "token": access_token,
+                    "token": token,
                     "expires_at":
                         time.time()
                         + expires_in,
                 }
 
-            return access_token
+            return token
 
         except requests.RequestException as exc:
 
             if attempt < 3:
+
                 time.sleep(2)
+
             else:
+
                 raise exc
 
     raise RuntimeError(
-        f"无法取得 Shopify Access Token: {domain}"
+        f"无法获取 Access Token：{domain}"
     )
 
 
@@ -464,10 +366,12 @@ def get_access_token(
         if (
             cached
             and time.time()
-            < float(
+            <
+            float(
                 cached["expires_at"]
             ) - 60
         ):
+
             return str(
                 cached["token"]
             )
@@ -480,7 +384,7 @@ def get_access_token(
 
 
 # ===========================================================================
-# Shopify GraphQL 请求
+# Shopify GraphQL
 # ===========================================================================
 
 def shopify_graphql(
@@ -507,7 +411,7 @@ def shopify_graphql(
         "query": query
     }
 
-    if variables:
+    if variables is not None:
         payload["variables"] = variables
 
     for attempt in range(1, 4):
@@ -527,17 +431,28 @@ def shopify_graphql(
             body = response.json()
 
             if body.get("errors"):
+
                 raise RuntimeError(
-                    f"GraphQL 错误: {body['errors']}"
+                    "GraphQL 错误："
+                    +
+                    json.dumps(
+                        body["errors"],
+                        ensure_ascii=False,
+                    )
                 )
 
-            return body.get("data") or {}
+            return body.get(
+                "data"
+            ) or {}
 
         except requests.RequestException as exc:
 
             if attempt < 3:
+
                 time.sleep(2)
+
             else:
+
                 raise exc
 
     return {}
@@ -556,7 +471,10 @@ def highest_risk_level(
         or "NONE"
     ).upper()
 
-    risk = node.get("risk") or {}
+    risk = (
+        node.get("risk")
+        or {}
+    )
 
     assessments = (
         risk.get("assessments")
@@ -594,12 +512,14 @@ def evaluate_order(
     node: dict[str, Any],
 ) -> tuple[bool, str, str]:
 
-    risk_level = highest_risk_level(
-        node
+    risk_level = (
+        highest_risk_level(node)
     )
 
     shipping = (
-        node.get("shippingAddress")
+        node.get(
+            "shippingAddress"
+        )
         or {}
     )
 
@@ -670,7 +590,7 @@ def build_reason(
 
 
 # ===========================================================================
-# 获取最近更新订单
+# 获取最近订单
 # ===========================================================================
 
 def fetch_recent_orders(
@@ -773,16 +693,18 @@ def check_store_worker(
             store
         )
 
-        raw_orders = fetch_recent_orders(
-            domain,
-            token,
+        orders = (
+            fetch_recent_orders(
+                domain,
+                token,
+            )
         )
 
     except Exception as exc:
 
         log(
-            f"店铺 {name} "
-            f"处理失败: {exc}"
+            f"店铺 {name} 处理失败："
+            f"{exc}"
         )
 
         return {
@@ -792,197 +714,74 @@ def check_store_worker(
                 [],
         }
 
-
-    # ----------------------------------------------------
-    # 每个店铺自己的数据库连接
-    # ----------------------------------------------------
-
-    conn = init_db()
-
     flagged_orders: list[
         dict[str, Any]
     ] = []
 
-    try:
+    for order in orders:
 
-        for order in raw_orders:
+        should_save, risk_level, address_status = (
+            evaluate_order(order)
+        )
 
-            order_name = str(
-                order.get("name")
-                or ""
-            )
+        if not should_save:
+            continue
 
-            if not order_name:
-                continue
+        flagged_orders.append(
+            {
+                "shop_name":
+                    name,
 
-
-            should_save, risk_level, address_status = (
-                evaluate_order(order)
-            )
-
-
-            # ------------------------------------------------
-            # 获取数据库中的历史状态
-            # ------------------------------------------------
-
-            previous_state = (
-                get_previous_order_state(
-                    conn,
+                "shop_domain":
                     domain,
-                    order_name,
-                )
-            )
 
-
-            created_at = str(
-                order.get("createdAt")
-                or ""
-            )
-
-            updated_at = str(
-                order.get("updatedAt")
-                or ""
-            )
-
-
-            # ------------------------------------------------
-            # 判断状态有没有变化
-            # ------------------------------------------------
-
-            state_changed = False
-
-            if previous_state is None:
-
-                # 第一次看到这个订单
-                state_changed = True
-
-            else:
-
-                if (
-                    previous_state["risk_level"]
-                    != risk_level
-                    or
-                    previous_state["address_status"]
-                    != address_status
-                ):
-                    state_changed = True
-
-
-            # ------------------------------------------------
-            # 第一次看到的订单：
-            #
-            # 只记录异常订单
-            # ------------------------------------------------
-
-            if previous_state is None:
-
-                if not should_save:
-
-                    # 正常订单也写入数据库
-                    # 作为以后状态变化的基准
-
-                    upsert_risk_order(
-                        conn,
-                        domain,
-                        order_name,
-                        risk_level,
-                        address_status,
-                        created_at,
-                        commit=False,
-                    )
-
-                    continue
-
-
-            # ------------------------------------------------
-            # 后续状态没有变化
-            #
-            # 不需要重复发送 Google
-            # ------------------------------------------------
-
-            elif not state_changed:
-
-                continue
-
-
-            # ------------------------------------------------
-            # 状态发生变化
-            #
-            # 包括：
-            #
-            # 高风险 → 无风险
-            # 无风险 → 高风险
-            # 地址正常 → 地址错误
-            # 地址错误 → 地址正常
-            # ------------------------------------------------
-
-            reason = build_reason(
-                risk_level,
-                address_status,
-            )
-
-
-            flagged_orders.append(
-                {
-                    "shop_name":
-                        name,
-
-                    "shop_domain":
-                        domain,
-
-                    "order_name":
-                        order_name,
-
-                    "risk_level":
-                        risk_level,
-
-                    "address_status":
-                        address_status,
-
-                    "created_at":
-                        created_at,
-
-                    "updated_at":
-                        updated_at,
-
-                    "reason":
-                        reason,
-
-                    "tags":
+                "order_name":
+                    str(
                         order.get(
-                            "tags"
+                            "name"
                         )
-                        or [],
-                }
-            )
+                        or ""
+                    ),
 
+                "risk_level":
+                    risk_level,
 
-            # ------------------------------------------------
-            # 保存最新状态
-            # ------------------------------------------------
+                "address_status":
+                    address_status,
 
-            upsert_risk_order(
-                conn,
-                domain,
-                order_name,
-                risk_level,
-                address_status,
-                created_at,
-                commit=False,
-            )
+                "created_at":
+                    str(
+                        order.get(
+                            "createdAt"
+                        )
+                        or ""
+                    ),
 
+                "updated_at":
+                    str(
+                        order.get(
+                            "updatedAt"
+                        )
+                        or ""
+                    ),
 
-        conn.commit()
+                "reason":
+                    build_reason(
+                        risk_level,
+                        address_status,
+                    ),
 
-    finally:
-
-        conn.close()
-
+                "tags":
+                    order.get(
+                        "tags"
+                    )
+                    or [],
+            }
+        )
 
     return {
         "store":
             store,
-
         "orders":
             flagged_orders,
     }
@@ -993,23 +792,27 @@ def check_store_worker(
 # ===========================================================================
 
 def sync_to_google_sheets(
-    all_orders_list: list[
+    orders: list[
         dict[str, Any]
     ],
 ) -> None:
 
     if not GAS_WEBHOOK_URL:
-        return
-
-
-    if not all_orders_list:
 
         log(
-            "本轮没有需要同步到 Google Sheets 的状态变化"
+            "GAS_WEBHOOK_URL 为空，"
+            "跳过 Google Sheets 同步"
         )
 
         return
 
+    if not orders:
+
+        log(
+            "本轮没有需要同步的异常订单"
+        )
+
+        return
 
     synced_at_utc = (
         datetime.now(
@@ -1019,91 +822,234 @@ def sync_to_google_sheets(
         )
     )
 
+    rows: list[list[Any]] = []
 
-    rows = []
+    for item in orders:
 
-
-    for item in all_orders_list:
-
-        created_at_utc = (
-            format_utc_time(
-                item["created_at"]
+        created_at = format_utc_time(
+            item.get(
+                "created_at",
+                "",
             )
         )
 
         tags_str = ", ".join(
-            item.get("tags")
+            item.get(
+                "tags",
+                []
+            )
             or []
         )
 
-
         rows.append(
             [
-                item["shop_name"],
-                item["shop_domain"],
-                item["order_name"],
+                item.get(
+                    "shop_name",
+                    "",
+                ),
+
+                item.get(
+                    "shop_domain",
+                    "",
+                ),
+
+                item.get(
+                    "order_name",
+                    "",
+                ),
+
                 RISK_MAP_CN.get(
-                    item["risk_level"],
-                    item["risk_level"],
+                    item.get(
+                        "risk_level",
+                        "",
+                    ),
+                    item.get(
+                        "risk_level",
+                        "",
+                    ),
                 ),
+
                 ADDR_MAP_CN.get(
-                    item["address_status"],
-                    item["address_status"],
+                    item.get(
+                        "address_status",
+                        "",
+                    ),
+                    item.get(
+                        "address_status",
+                        "",
+                    ),
                 ),
-                created_at_utc,
-                item["reason"],
+
+                created_at,
+
+                item.get(
+                    "reason",
+                    "",
+                ),
+
                 synced_at_utc,
+
                 tags_str,
             ]
         )
-
 
     payload = {
         "rows": rows,
     }
 
-
-    # ----------------------------------------------------
-    # 发送到 Google Apps Script
-    # ----------------------------------------------------
-
     for attempt in range(1, 4):
 
         try:
 
-            resp = requests.post(
+            # -------------------------------------------------------
+            # 第一次请求
+            #
+            # 不自动跟随重定向。
+            #
+            # Apps Script ContentService Web App 的响应可能经过
+            # googleusercontent.com 重定向。
+            # -------------------------------------------------------
+
+            response = requests.post(
                 GAS_WEBHOOK_URL,
                 json=payload,
+                headers={
+                    "Content-Type":
+                        "application/json",
+                    "Accept":
+                        "application/json",
+                },
                 timeout=30,
                 verify=False,
+                allow_redirects=False,
             )
-
-            resp.raise_for_status()
 
             log(
-                f"Google Sheets 同步成功，"
-                f"发送 {len(rows)} 条订单状态变化"
+                "GAS 首次响应 HTTP："
+                f"{response.status_code}"
             )
 
-            break
+            # -------------------------------------------------------
+            # 302 / 301 / 303 / 307 / 308
+            # -------------------------------------------------------
 
-        except requests.RequestException as exc:
+            if response.status_code in {
+                301,
+                302,
+                303,
+                307,
+                308,
+            }:
+
+                redirect_url = (
+                    response.headers.get(
+                        "Location"
+                    )
+                )
+
+                if not redirect_url:
+
+                    raise RuntimeError(
+                        "GAS 返回重定向，"
+                        "但没有 Location"
+                    )
+
+                log(
+                    "GAS 返回重定向，"
+                    "继续发送 POST"
+                )
+
+                response = requests.post(
+                    redirect_url,
+                    json=payload,
+                    headers={
+                        "Content-Type":
+                            "application/json",
+                        "Accept":
+                            "application/json",
+                    },
+                    timeout=30,
+                    verify=False,
+                    allow_redirects=False,
+                )
+
+                log(
+                    "GAS 重定向目标 HTTP："
+                    f"{response.status_code}"
+                )
+
+            # -------------------------------------------------------
+            # HTTP 状态检查
+            # -------------------------------------------------------
+
+            response.raise_for_status()
+
+            response_text = (
+                response.text.strip()
+            )
+
+            log(
+                "GAS 返回内容："
+                +
+                response_text[:1500]
+            )
+
+            # -------------------------------------------------------
+            # JSON 检查
+            # -------------------------------------------------------
+
+            try:
+
+                result = response.json()
+
+            except Exception as exc:
+
+                raise RuntimeError(
+                    "GAS 没有返回有效 JSON："
+                    f"{exc}；原始内容："
+                    f"{response_text[:500]}"
+                )
+
+            # -------------------------------------------------------
+            # 真正判断 GAS 是否成功
+            # -------------------------------------------------------
+
+            if result.get("ok") is not True:
+
+                raise RuntimeError(
+                    "GAS 返回失败："
+                    +
+                    json.dumps(
+                        result,
+                        ensure_ascii=False,
+                    )
+                )
+
+            log(
+                "Google Sheets 同步成功："
+                f"新增 {result.get('added', 0)} 条，"
+                f"更新 {result.get('updated', 0)} 条，"
+                f"共处理 {result.get('total', 0)} 条"
+            )
+
+            return
+
+        except Exception as exc:
 
             if attempt < 3:
 
                 log(
-                    f"Google Sheets 同步失败，"
-                    f"第 {attempt} 次，"
-                    f"2 秒后重试：{exc}"
+                    "Google Sheets 同步失败，"
+                    f"第 {attempt} 次：{exc}"
                 )
 
                 time.sleep(2)
 
             else:
 
-                log(
-                    f"Google Sheets 批量同步失败，"
-                    f"已重试 3 次：{exc}"
+                raise RuntimeError(
+                    "Google Sheets 同步最终失败："
+                    f"{exc}"
                 )
 
 
@@ -1117,14 +1063,15 @@ def run_check() -> None:
         "===== 开始本轮风控巡检 ====="
     )
 
-
     stores = load_stores()
 
+    log(
+        f"共读取 {len(stores)} 个店铺"
+    )
 
     worker_results: list[
         dict[str, Any]
     ] = []
-
 
     with ThreadPoolExecutor(
         max_workers=MAX_WORKERS
@@ -1138,7 +1085,6 @@ def run_check() -> None:
             for store in stores
         ]
 
-
         for future in as_completed(
             futures
         ):
@@ -1147,32 +1093,31 @@ def run_check() -> None:
                 future.result()
             )
 
-
-    all_changed_orders: list[
+    all_flagged_orders: list[
         dict[str, Any]
     ] = []
 
-
     for result in worker_results:
 
-        for item in result[
-            "orders"
-        ]:
-
-            all_changed_orders.append(
-                item
+        all_flagged_orders.extend(
+            result.get(
+                "orders",
+                []
             )
-
-
-    sync_to_google_sheets(
-        all_changed_orders
-    )
-
+        )
 
     log(
-        "===== 本轮巡检结束，"
-        f"共发现 {len(all_changed_orders)} "
-        "条状态变化 ====="
+        f"本轮共发现 "
+        f"{len(all_flagged_orders)} "
+        "条异常订单"
+    )
+
+    sync_to_google_sheets(
+        all_flagged_orders
+    )
+
+    log(
+        "===== 本轮风控巡检结束 ====="
     )
 
 
@@ -1181,4 +1126,16 @@ def run_check() -> None:
 # ===========================================================================
 
 if __name__ == "__main__":
-    run_check()
+
+    try:
+
+        run_check()
+
+    except Exception as exc:
+
+        log(
+            "程序最终失败："
+            f"{exc}"
+        )
+
+        raise
