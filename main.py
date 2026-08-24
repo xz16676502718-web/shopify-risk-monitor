@@ -334,7 +334,7 @@ def build_reason(risk_level: str, address_status: str) -> str:
 
 def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
     if not GAS_WEBHOOK_URL:
-        log("未配置 GAS_WEBHOOK_URL，跳过 Google Sheets 同步。")
+        log("❌ 错误: 未配置环境变量 GAS_WEBHOOK_URL，请前往 GitHub Secrets 添加入口地址！")
         return
 
     synced_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
