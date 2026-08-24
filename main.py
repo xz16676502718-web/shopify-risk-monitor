@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 多店铺 Shopify 风控中台 — 定时拉取高风险 / 地址异常订单并同步至 Google Sheets。
-支持环境变量、多线程并发巡检、SQLite 本地缓存及网络容错重试。
+支持环境变量 (STORES_JSON / GAS_WEBHOOK_URL)、多线程并发巡检、SQLite 本地缓存及网络容错重试。
 """
 
 from __future__ import annotations
@@ -175,11 +175,15 @@ _token_lock = threading.Lock()
 
 
 def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
-    if not stores_path.exists():
-        raise FileNotFoundError(f"找不到店铺配置文件: {stores_path}")
-
-    with stores_path.open(encoding="utf-8") as f:
-        data = json.load(f)
+    # 优先从环境变量读取 STORES_JSON（适合 GitHub Actions），没有再读本地 stores.json
+    env_stores = os.getenv("STORES_JSON")
+    if env_stores and env_stores.strip():
+        data = json.loads(env_stores)
+    elif stores_path.exists():
+        with stores_path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        raise FileNotFoundError(f"未找到店铺配置！请配置 GitHub Secret 'STORES_JSON' 或在根目录提供 '{stores_path.name}' 文件。")
 
     stores: list[dict[str, str]] = []
     for idx, item in enumerate(data, start=1):
