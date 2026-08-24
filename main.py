@@ -32,12 +32,12 @@ BASE_DIR = Path(__file__).resolve().parent
 STORES_FILE = BASE_DIR / "stores.json"
 DB_FILE = BASE_DIR / "orders.db"
 API_VERSION = "2026-07"
-MAX_WORKERS = 10
+MAX_WORKERS = 10  # 店铺并发数
+ORDER_EVAL_WORKERS = 8  # 单店铺内订单并发评估数
 
-# 优先读取环境变量中的 GAS_WEBHOOK_URL，若未设置则使用默认 Webhook 地址
 GAS_WEBHOOK_URL = os.getenv(
     "GAS_WEBHOOK_URL",
-    "https://script.google.com/macros/s/AKfycbwZmUawxHNCYP4w3IDchs-ape2pfTf4Ua9XHhqCv94vh8ur4HyGasvUUx-Rhp3qeyxM/exec"
+    "https://script.google.com/macros/s/AKfycbwZmUawxHNCYP4w3IDchs-ape2pfTf4Ua9XHhqCv94vh8ur4HyGasvUUx-Rhp3qeyxM/exec",
 )
 
 RISK_PRIORITY = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0, "PENDING": 0}
@@ -140,7 +140,6 @@ _token_lock = threading.Lock()
 
 
 def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
-    # 优先从环境变量读取 STORES_JSON（适合 GitHub Actions），没有再读本地 stores.json
     env_stores = os.getenv("STORES_JSON")
     if env_stores and env_stores.strip():
         data = json.loads(env_stores)
@@ -209,21 +208,19 @@ def get_access_token(store: dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# REST API 全量订单拉取（替换原 GraphQL fetch_recent_orders）
+# REST API 全量订单拉取
 # ---------------------------------------------------------------------------
 
 
 def get_all_orders_from_shopify(
     shop_domain: str, access_token: str
 ) -> list[dict]:
-    """全量获取店铺近 30 天内的所有订单（不限状态、自动分页、防漏单）"""
+    """全量获取店铺近 30 天内的所有订单（不限状态、自动游标分页、防漏单）"""
     all_orders = []
 
-    # 1. 计算 UTC 时间 30 天前的起始时间点
     thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
     updated_at_min = thirty_days_ago.isoformat()
 
-    # 2. 构建 API URL：包含 status=any, limit=250, updated_at_min
     url = (
         f"https://{shop_domain}/admin/api/{API_VERSION}/orders.json"
         f"?status=any&limit=250&updated_at_min={updated_at_min}"
@@ -234,7 +231,6 @@ def get_all_orders_from_shopify(
         try:
             response = requests.get(url, headers=headers, timeout=15, verify=False)
 
-            # 遇到 Shopify API 限流（429）时自动挂起重试
             if response.status_code == 429:
                 retry_after = float(response.headers.get("Retry-After", 2.0))
                 log(f"⚠️  触发限流，{retry_after}s 后重试 ({shop_domain})")
@@ -246,7 +242,6 @@ def get_all_orders_from_shopify(
             orders = data.get("orders", [])
             all_orders.extend(orders)
 
-            # 解析 Link 响应头，获取下一页游标
             link_header = response.headers.get("Link")
             url = None
             if link_header:
@@ -255,7 +250,7 @@ def get_all_orders_from_shopify(
                         url = match.split(";")[0].strip("<> ")
                         break
 
-            time.sleep(0.3)  # 平抑并发频率，保护 API 额度
+            time.sleep(0.3)
 
         except Exception as e:
             log(f"❌ 获取店铺 {shop_domain} 订单失败: {e}")
@@ -264,59 +259,135 @@ def get_all_orders_from_shopify(
     return all_orders
 
 
+def fetch_order_risks(
+    shop_domain: str, access_token: str, order_id: int
+) -> list[dict[str, Any]]:
+    """单独向 Shopify API 请求特定订单的 Fraud Risks 数据"""
+    url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}/risks.json"
+    headers = {"X-Shopify-Access-Token": access_token}
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, headers=headers, timeout=5, verify=False)
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", 1.0))
+                time.sleep(retry_after)
+                continue
+            if resp.status_code == 200:
+                return resp.json().get("risks", [])
+        except Exception:
+            pass
+        break
+    return []
+
+
 # ---------------------------------------------------------------------------
-# 风险评估逻辑（适配 REST API 响应字段）
+# 深度风险与地址评估引擎
 # ---------------------------------------------------------------------------
 
 
-def highest_risk_level(order: dict[str, Any]) -> str:
-    """
-    REST API 订单风险字段：
-      - order["risks"] 若已通过 fields 参数拉取，则为列表；
-        常规 orders.json 不返回 risks，需单独请求 /orders/{id}/risks.json。
-      - 此处优先读取 order 顶层 "risk_level"（部分店铺计划可见），
-        兜底为 "NONE"。
-    """
-    # 部分 Shopify 计划在订单对象中直接暴露 risk_level
-    direct_level = str(order.get("risk_level") or "NONE").upper()
-    best_score = RISK_PRIORITY.get(direct_level, 0)
-    best = direct_level
+def get_order_risk_and_address_status(
+    order: dict[str, Any], shop_domain: str, access_token: str
+) -> tuple[bool, str, str]:
+    """综合 API 风险数据、订单标签、AVS 响应、地址完整度判定风险与地址状态"""
+    order_id = order.get("id")
+    tags_raw = order.get("tags") or ""
+    tags_str = (
+        ", ".join(tags_raw).lower()
+        if isinstance(tags_raw, list)
+        else str(tags_raw).lower()
+    )
 
-    # 若已随订单返回 risks 列表（需开启对应字段权限）
-    risks = order.get("risks") or []
-    for risk in risks:
-        level = str(risk.get("recommendation") or "NONE").upper()
-        # REST risks.recommendation: "cancel" → HIGH, "investigate" → MEDIUM, "accept" → LOW
-        level_mapped = {
-            "CANCEL": "HIGH",
-            "INVESTIGATE": "MEDIUM",
-            "ACCEPT": "LOW",
-        }.get(level, level)
-        score = RISK_PRIORITY.get(level_mapped, 0)
-        if score > best_score:
-            best = level_mapped
-            best_score = score
-
-    return best
-
-
-def evaluate_order(order: dict[str, Any]) -> tuple[bool, str, str]:
-    """
-    REST API 地址字段：
-      order["shipping_address"]["validation_result_summary"]
-    （需店铺开启地址验证功能，否则字段可能为 None）
-    """
-    risk_level = highest_risk_level(order)
-
+    # 1. 地址评估
     shipping = order.get("shipping_address") or {}
-    address_status = str(shipping.get("validation_result_summary") or "").upper()
+    address_status = "NO_ISSUES"
 
+    # A. 直接校验字段
+    raw_val = str(
+        shipping.get("validation_result_summary")
+        or shipping.get("validation_status")
+        or ""
+    ).upper()
+    if raw_val in ADDR_MAP_CN:
+        address_status = raw_val
+
+    # B. 地址完整性检查（缺失 address1 / zip / city）
+    if not shipping or not shipping.get("address1") or not shipping.get("zip"):
+        address_status = "INCOMPLETE"
+
+    # C. 标签匹配（地址警告/错误）
+    if any(
+        kw in tags_str
+        for kw in ["address warning", "地址警告", "address_warning"]
+    ):
+        address_status = "WARNING"
+    elif any(
+        kw in tags_str
+        for kw in ["address error", "地址错误", "invalid address"]
+    ):
+        address_status = "ERROR"
+    elif any(kw in tags_str for kw in ["address incomplete", "地址不完整"]):
+        address_status = "INCOMPLETE"
+
+    # D. AVS 校验码检查
+    payment_details = order.get("payment_details") or {}
+    avs_code = str(payment_details.get("avs_result_code") or "").upper()
+    if avs_code == "N":
+        address_status = "ERROR"
+    elif avs_code in {"A", "Z"}:
+        address_status = "WARNING"
+    elif avs_code in {"W", "U", "R", "S", "G", "I"} and address_status == "NO_ISSUES":
+        address_status = "UNVERIFIED"
+
+    # 2. 风险等级评估
+    risk_level = "NONE"
+
+    # A. 取消原因
+    if order.get("cancel_reason") == "fraud":
+        risk_level = "HIGH"
+
+    # B. 标签匹配（欺诈/高风险）
+    if any(kw in tags_str for kw in ["high risk", "高风险", "fraud", "欺诈"]):
+        risk_level = "HIGH"
+    elif any(kw in tags_str for kw in ["medium risk", "中风险"]):
+        risk_level = "MEDIUM"
+    elif any(kw in tags_str for kw in ["low risk", "低风险"]):
+        risk_level = "LOW"
+
+    # C. 调用 REST Risks API 获取真实风险得分（仅非取消订单查询）
+    if order_id and risk_level != "HIGH":
+        risks = fetch_order_risks(shop_domain, access_token, order_id)
+        best_score = RISK_PRIORITY.get(risk_level, 0)
+        for r in risks:
+            rec = str(r.get("recommendation") or "").lower()
+            try:
+                score_val = float(r.get("score") or 0.0)
+            except (ValueError, TypeError):
+                score_val = 0.0
+            cause_cancel = r.get("cause_cancel") is True
+
+            mapped_level = "NONE"
+            if rec == "cancel" or score_val >= 0.75 or cause_cancel:
+                mapped_level = "HIGH"
+            elif rec == "investigate" or score_val >= 0.4:
+                mapped_level = "MEDIUM"
+            elif rec == "accept":
+                mapped_level = "LOW"
+
+            if RISK_PRIORITY.get(mapped_level, 0) > best_score:
+                risk_level = mapped_level
+                best_score = RISK_PRIORITY.get(mapped_level, 0)
+
+    # 3. 命中判定条件
     hit_risk = risk_level == "HIGH"
-    hit_address = address_status in {"ERROR", "WARNING", "INCOMPLETE", "UNVERIFIED"}
+    hit_address = address_status in {
+        "ERROR",
+        "WARNING",
+        "INCOMPLETE",
+        "UNVERIFIED",
+    }
+    should_save = hit_risk or hit_address
 
-    if hit_risk or hit_address:
-        return True, risk_level, address_status
-    return False, risk_level, address_status
+    return should_save, risk_level, address_status
 
 
 def build_reason(risk_level: str, address_status: str) -> str:
@@ -329,7 +400,7 @@ def build_reason(risk_level: str, address_status: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets 批量同步（含密钥动态推送与网络重试机制）
+# Google Sheets 批量同步
 # ---------------------------------------------------------------------------
 
 
@@ -344,11 +415,9 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
     for item in all_orders_list:
         created_at_utc = format_utc_time(item["created_at"])
         tags_raw = item.get("tags") or ""
-        # REST API tags 字段为逗号分隔字符串；GraphQL 为列表，兼容两种格式
-        if isinstance(tags_raw, list):
-            tags_str = ", ".join(tags_raw)
-        else:
-            tags_str = str(tags_raw)
+        tags_str = (
+            ", ".join(tags_raw) if isinstance(tags_raw, list) else str(tags_raw)
+        )
 
         rows.append([
             item["shop_name"],
@@ -409,7 +478,6 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
 
     try:
         token = get_access_token(store)
-        # 使用 REST API 全量拉取替代原 GraphQL 方法
         raw_orders = get_all_orders_from_shopify(domain, token)
     except Exception as exc:
         log(f"店铺 {name} 处理失败: {exc}")
@@ -418,22 +486,35 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
     log(f"店铺 {name} 共拉取 {len(raw_orders)} 条订单，开始风险评估...")
 
     flagged_orders: list[dict[str, Any]] = []
-    for order in raw_orders:
-        should_save, risk_level, address_status = evaluate_order(order)
-        if not should_save:
-            continue
 
-        # REST API 使用 snake_case 字段名（created_at / name）
-        flagged_orders.append({
+    def eval_single_order(order: dict[str, Any]) -> dict[str, Any] | None:
+        should_save, risk_level, address_status = (
+            get_order_risk_and_address_status(order, domain, token)
+        )
+        if not should_save:
+            return None
+
+        return {
             "shop_name": name,
             "shop_domain": domain,
             "order_name": str(order.get("name") or ""),
             "risk_level": risk_level,
             "address_status": address_status,
-            "created_at": str(order.get("created_at") or ""),   # REST: created_at
+            "created_at": str(order.get("created_at") or ""),
             "reason": build_reason(risk_level, address_status),
-            "tags": order.get("tags") or "",                    # REST: 逗号字符串
-        })
+            "tags": order.get("tags") or "",
+        }
+
+    # 店铺内部多线程并发拉取 Risks 节点并计算风险
+    with ThreadPoolExecutor(max_workers=ORDER_EVAL_WORKERS) as eval_executor:
+        futures = [
+            eval_executor.submit(eval_single_order, order)
+            for order in raw_orders
+        ]
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                flagged_orders.append(res)
 
     log(f"店铺 {name} 命中高风险/地址异常订单 {len(flagged_orders)} 条")
     return {"store": store, "orders": flagged_orders}
@@ -445,7 +526,9 @@ def run_check() -> None:
 
     worker_results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(check_store_worker, store) for store in stores]
+        futures = [
+            executor.submit(check_store_worker, store) for store in stores
+        ]
         for future in as_completed(futures):
             worker_results.append(future.result())
 
