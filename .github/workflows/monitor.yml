@@ -29,5 +29,6 @@ jobs:
       - name: 执行多店铺风控巡检
         env:
           GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          STORES_JSON: ${{ secrets.STORES_JSON }}
         run: |
           python main.py
