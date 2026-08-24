@@ -21,12 +21,7 @@ from typing import Any
 import requests
 import urllib3
 
-# 禁用不安全 HTTPS 请求警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# ---------------------------------------------------------------------------
-# 全局配置与字典映射
-# ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 STORES_FILE = BASE_DIR / "stores.json"
@@ -53,7 +48,7 @@ RISK_MAP_CN = {
 ADDR_MAP_CN = {
     "NO_ISSUES": "无异常",
     "VALIDATED": "无异常",
-    "WARNING": "地址警告",
+    "WARNING": "地址不完整",
     "ERROR": "地址错误",
     "INCOMPLETE": "地址不完整",
     "UNVERIFIED": "未验证地址",
@@ -73,15 +68,9 @@ def log(msg: str) -> None:
 
 
 def format_utc_time(iso_str: str) -> str:
-    """格式化原始 UTC 时间字符串为干净的 YYYY-MM-DD HH:MM:SS"""
     if not iso_str:
         return ""
     return iso_str.replace("T", " ").replace("Z", "").split(".")[0]
-
-
-# ---------------------------------------------------------------------------
-# SQLite 本地持久化与去重引擎
-# ---------------------------------------------------------------------------
 
 
 def init_db(db_path: Path = DB_FILE) -> sqlite3.Connection:
@@ -131,10 +120,6 @@ def upsert_risk_order(
         conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Shopify API Token 动态管理
-# ---------------------------------------------------------------------------
-
 _token_cache: dict[str, dict[str, float | str]] = {}
 _token_lock = threading.Lock()
 
@@ -147,9 +132,7 @@ def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
         with stores_path.open(encoding="utf-8") as f:
             data = json.load(f)
     else:
-        raise FileNotFoundError(
-            f"未找到店铺配置！请配置 GitHub Secret 'STORES_JSON' 或在根目录提供 '{stores_path.name}' 文件。"
-        )
+        raise FileNotFoundError("未找到店铺配置 stores.json！")
 
     stores: list[dict[str, str]] = []
     for idx, item in enumerate(data, start=1):
@@ -207,17 +190,10 @@ def get_access_token(store: dict[str, str]) -> str:
     return fetch_access_token(domain, store["client_id"], store["client_secret"])
 
 
-# ---------------------------------------------------------------------------
-# REST API 全量订单拉取
-# ---------------------------------------------------------------------------
-
-
 def get_all_orders_from_shopify(
     shop_domain: str, access_token: str
 ) -> list[dict]:
-    """全量获取店铺近 30 天内的所有订单（不限状态、自动游标分页、防漏单）"""
     all_orders = []
-
     thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
     updated_at_min = thirty_days_ago.isoformat()
 
@@ -230,10 +206,8 @@ def get_all_orders_from_shopify(
     while url:
         try:
             response = requests.get(url, headers=headers, timeout=15, verify=False)
-
             if response.status_code == 429:
                 retry_after = float(response.headers.get("Retry-After", 2.0))
-                log(f"⚠️  触发限流，{retry_after}s 后重试 ({shop_domain})")
                 time.sleep(retry_after)
                 continue
 
@@ -249,9 +223,7 @@ def get_all_orders_from_shopify(
                     if 'rel="next"' in match:
                         url = match.split(";")[0].strip("<> ")
                         break
-
             time.sleep(0.3)
-
         except Exception as e:
             log(f"❌ 获取店铺 {shop_domain} 订单失败: {e}")
             break
@@ -259,10 +231,65 @@ def get_all_orders_from_shopify(
     return all_orders
 
 
+def fetch_address_validations_graphql(
+    shop_domain: str, access_token: str, order_ids: list[int]
+) -> dict[int, str]:
+    """通过 Shopify GraphQL API 批量获取订单橙色标 (validationResultSummary)"""
+    if not order_ids:
+        return {}
+
+    url = f"https://{shop_domain}/admin/api/{API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+    }
+
+    results: dict[int, str] = {}
+    chunk_size = 50
+
+    for i in range(0, len(order_ids), chunk_size):
+        chunk = order_ids[i : i + chunk_size]
+        gids = [f"gid://shopify/Order/{oid}" for oid in chunk]
+
+        query = """
+        query getAddressValidation($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on Order {
+              legacyResourceId
+              shippingAddress {
+                validationResultSummary
+              }
+            }
+          }
+        }
+        """
+        payload = {"query": query, "variables": {"ids": gids}}
+
+        try:
+            resp = requests.post(
+                url, headers=headers, json=payload, timeout=15, verify=False
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                nodes = data.get("data", {}).get("nodes") or []
+                for node in nodes:
+                    if node and "legacyResourceId" in node:
+                        oid = int(node["legacyResourceId"])
+                        shipping = node.get("shippingAddress") or {}
+                        summary = str(
+                            shipping.get("validationResultSummary") or ""
+                        ).upper()
+                        if summary:
+                            results[oid] = summary
+        except Exception as e:
+            log(f"⚠️ GraphQL 查询异常 ({shop_domain}): {e}")
+
+    return results
+
+
 def fetch_order_risks(
     shop_domain: str, access_token: str, order_id: int
 ) -> list[dict[str, Any]]:
-    """单独向 Shopify API 请求特定订单的 Fraud Risks 数据"""
     url = f"https://{shop_domain}/admin/api/{API_VERSION}/orders/{order_id}/risks.json"
     headers = {"X-Shopify-Access-Token": access_token}
     for attempt in range(2):
@@ -280,15 +307,12 @@ def fetch_order_risks(
     return []
 
 
-# ---------------------------------------------------------------------------
-# 精准风险与地址评估引擎（只抓橙色官方警告标 + 真实 Fraud 高风险）
-# ---------------------------------------------------------------------------
-
-
 def get_order_risk_and_address_status(
-    order: dict[str, Any], shop_domain: str, access_token: str
+    order: dict[str, Any],
+    shop_domain: str,
+    access_token: str,
+    gql_status: str = "",
 ) -> tuple[bool, str, str]:
-    """精准识别 Shopify 官方橙色地址警告标与高风险欺诈订单"""
     order_id = order.get("id")
     tags_raw = order.get("tags") or ""
     tags_str = (
@@ -297,25 +321,10 @@ def get_order_risk_and_address_status(
         else str(tags_raw).lower()
     )
 
-    # -----------------------------------------------------------------------
-    # 1. 地址评估：只抓取 Shopify 官方橙色地址警告标
-    # -----------------------------------------------------------------------
+    # 1. 地址评估（精准对应后台橙色标）
     address_status = "NO_ISSUES"
-    shipping = order.get("shipping_address") or {}
-
-    # 读取 Shopify 官方地址校验结果（橙色图标直接对应的 API 字段）
-    val_summary = str(
-        shipping.get("validation_result_summary")
-        or shipping.get("validation_status")
-        or ""
-    ).upper()
-
-    if val_summary in {"WARNING", "ERROR"}:
-        address_status = val_summary
-    elif (
-        shipping.get("proposed_address") is not None
-    ):  # 存在推荐修补地址，必为橙色标
-        address_status = "WARNING"
+    if gql_status in {"WARNING", "ERROR"}:
+        address_status = gql_status
     elif any(
         kw in tags_str
         for kw in ["address warning", "地址警告", "address_warning"]
@@ -327,17 +336,13 @@ def get_order_risk_and_address_status(
     ):
         address_status = "ERROR"
 
-    # -----------------------------------------------------------------------
-    # 2. 风险评估：只抓取真正的 High Risk / 欺诈订单
-    # -----------------------------------------------------------------------
+    # 2. 风险评估
     risk_level = "NONE"
-
     if order.get("cancel_reason") == "fraud" or any(
         kw in tags_str for kw in ["high risk", "高风险", "fraud", "欺诈"]
     ):
         risk_level = "HIGH"
 
-    # 若尚未确定为高风险，请求 Risks API 获取真实得分
     if order_id and risk_level != "HIGH":
         risks = fetch_order_risks(shop_domain, access_token, order_id)
         best_score = RISK_PRIORITY.get(risk_level, 0)
@@ -360,9 +365,6 @@ def get_order_risk_and_address_status(
                 risk_level = mapped_level
                 best_score = RISK_PRIORITY.get(mapped_level, 0)
 
-    # -----------------------------------------------------------------------
-    # 3. 命中判定：只有真正的橙色地址警告 或 真正的 Fraud 高风险才抓取
-    # -----------------------------------------------------------------------
     hit_risk = risk_level == "HIGH"
     hit_address = address_status in {"ERROR", "WARNING"}
     should_save = hit_risk or hit_address
@@ -379,14 +381,9 @@ def build_reason(risk_level: str, address_status: str) -> str:
     return ", ".join(reasons)
 
 
-# ---------------------------------------------------------------------------
-# Google Sheets 批量同步
-# ---------------------------------------------------------------------------
-
-
 def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
     if not GAS_WEBHOOK_URL:
-        log("❌ 错误: 未配置环境变量 GAS_WEBHOOK_URL，请前往 GitHub Secrets 添加入口地址！")
+        log("❌ 错误: 未配置环境变量 GAS_WEBHOOK_URL！")
         return
 
     synced_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -440,15 +437,9 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
             break
         except Exception as exc:
             if attempt == 3:
-                log(f"Google Sheets 批量同步失败 (已重试 3 次): {exc}")
+                log(f"Google Sheets 批量同步失败: {exc}")
             else:
-                log(f"第 {attempt} 次同步尝试失败，等待重试: {exc}")
                 time.sleep(2)
-
-
-# ---------------------------------------------------------------------------
-# 巡检多线程并发引擎
-# ---------------------------------------------------------------------------
 
 
 def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
@@ -465,11 +456,19 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
 
     log(f"店铺 {name} 共拉取 {len(raw_orders)} 条订单，开始风险评估...")
 
+    order_ids = [o["id"] for o in raw_orders if o.get("id")]
+    gql_val_map = fetch_address_validations_graphql(domain, token, order_ids)
+
     flagged_orders: list[dict[str, Any]] = []
 
     def eval_single_order(order: dict[str, Any]) -> dict[str, Any] | None:
+        oid = order.get("id")
+        gql_status = gql_val_map.get(oid, "")
+
         should_save, risk_level, address_status = (
-            get_order_risk_and_address_status(order, domain, token)
+            get_order_risk_and_address_status(
+                order, domain, token, gql_status=gql_status
+            )
         )
         if not should_save:
             return None
@@ -485,7 +484,6 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
             "tags": order.get("tags") or "",
         }
 
-    # 店铺内部多线程并发拉取 Risks 节点并计算风险
     with ThreadPoolExecutor(max_workers=ORDER_EVAL_WORKERS) as eval_executor:
         futures = [
             eval_executor.submit(eval_single_order, order)
