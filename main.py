@@ -32,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STORES_FILE = BASE_DIR / "stores.json"
 DB_FILE = BASE_DIR / "orders.db"
 API_VERSION = "2026-07"
-MAX_WORKERS = 10  # 店铺并发数
+MAX_WORKERS = 10        # 店铺并发数
 ORDER_EVAL_WORKERS = 8  # 单店铺内订单并发评估数
 
 GAS_WEBHOOK_URL = os.getenv(
@@ -281,14 +281,14 @@ def fetch_order_risks(
 
 
 # ---------------------------------------------------------------------------
-# 深度风险与地址评估引擎
+# 精准风险与地址评估引擎（只抓橙色官方警告标 + 真实 Fraud 高风险）
 # ---------------------------------------------------------------------------
 
 
 def get_order_risk_and_address_status(
     order: dict[str, Any], shop_domain: str, access_token: str
 ) -> tuple[bool, str, str]:
-    """综合 API 风险数据、订单标签、AVS 响应、地址完整度判定风险与地址状态"""
+    """精准识别 Shopify 官方橙色地址警告标与高风险欺诈订单"""
     order_id = order.get("id")
     tags_raw = order.get("tags") or ""
     tags_str = (
@@ -297,25 +297,26 @@ def get_order_risk_and_address_status(
         else str(tags_raw).lower()
     )
 
-    # 1. 地址评估
-    shipping = order.get("shipping_address") or {}
+    # -----------------------------------------------------------------------
+    # 1. 地址评估：只抓取 Shopify 官方橙色地址警告标
+    # -----------------------------------------------------------------------
     address_status = "NO_ISSUES"
+    shipping = order.get("shipping_address") or {}
 
-    # A. 直接校验字段
-    raw_val = str(
+    # 读取 Shopify 官方地址校验结果（橙色图标直接对应的 API 字段）
+    val_summary = str(
         shipping.get("validation_result_summary")
         or shipping.get("validation_status")
         or ""
     ).upper()
-    if raw_val in ADDR_MAP_CN:
-        address_status = raw_val
 
-    # B. 地址完整性检查（缺失 address1 / zip / city）
-    if not shipping or not shipping.get("address1") or not shipping.get("zip"):
-        address_status = "INCOMPLETE"
-
-    # C. 标签匹配（地址警告/错误）
-    if any(
+    if val_summary in {"WARNING", "ERROR"}:
+        address_status = val_summary
+    elif (
+        shipping.get("proposed_address") is not None
+    ):  # 存在推荐修补地址，必为橙色标
+        address_status = "WARNING"
+    elif any(
         kw in tags_str
         for kw in ["address warning", "地址警告", "address_warning"]
     ):
@@ -325,35 +326,18 @@ def get_order_risk_and_address_status(
         for kw in ["address error", "地址错误", "invalid address"]
     ):
         address_status = "ERROR"
-    elif any(kw in tags_str for kw in ["address incomplete", "地址不完整"]):
-        address_status = "INCOMPLETE"
 
-    # D. AVS 校验码检查
-    payment_details = order.get("payment_details") or {}
-    avs_code = str(payment_details.get("avs_result_code") or "").upper()
-    if avs_code == "N":
-        address_status = "ERROR"
-    elif avs_code in {"A", "Z"}:
-        address_status = "WARNING"
-    elif avs_code in {"W", "U", "R", "S", "G", "I"} and address_status == "NO_ISSUES":
-        address_status = "UNVERIFIED"
-
-    # 2. 风险等级评估
+    # -----------------------------------------------------------------------
+    # 2. 风险评估：只抓取真正的 High Risk / 欺诈订单
+    # -----------------------------------------------------------------------
     risk_level = "NONE"
 
-    # A. 取消原因
-    if order.get("cancel_reason") == "fraud":
+    if order.get("cancel_reason") == "fraud" or any(
+        kw in tags_str for kw in ["high risk", "高风险", "fraud", "欺诈"]
+    ):
         risk_level = "HIGH"
 
-    # B. 标签匹配（欺诈/高风险）
-    if any(kw in tags_str for kw in ["high risk", "高风险", "fraud", "欺诈"]):
-        risk_level = "HIGH"
-    elif any(kw in tags_str for kw in ["medium risk", "中风险"]):
-        risk_level = "MEDIUM"
-    elif any(kw in tags_str for kw in ["low risk", "低风险"]):
-        risk_level = "LOW"
-
-    # C. 调用 REST Risks API 获取真实风险得分（仅非取消订单查询）
+    # 若尚未确定为高风险，请求 Risks API 获取真实得分
     if order_id and risk_level != "HIGH":
         risks = fetch_order_risks(shop_domain, access_token, order_id)
         best_score = RISK_PRIORITY.get(risk_level, 0)
@@ -363,28 +347,24 @@ def get_order_risk_and_address_status(
                 score_val = float(r.get("score") or 0.0)
             except (ValueError, TypeError):
                 score_val = 0.0
-            cause_cancel = r.get("cause_cancel") is True
 
             mapped_level = "NONE"
-            if rec == "cancel" or score_val >= 0.75 or cause_cancel:
+            if (
+                rec == "cancel"
+                or score_val >= 0.75
+                or r.get("cause_cancel") is True
+            ):
                 mapped_level = "HIGH"
-            elif rec == "investigate" or score_val >= 0.4:
-                mapped_level = "MEDIUM"
-            elif rec == "accept":
-                mapped_level = "LOW"
 
             if RISK_PRIORITY.get(mapped_level, 0) > best_score:
                 risk_level = mapped_level
                 best_score = RISK_PRIORITY.get(mapped_level, 0)
 
-    # 3. 命中判定条件
+    # -----------------------------------------------------------------------
+    # 3. 命中判定：只有真正的橙色地址警告 或 真正的 Fraud 高风险才抓取
+    # -----------------------------------------------------------------------
     hit_risk = risk_level == "HIGH"
-    hit_address = address_status in {
-        "ERROR",
-        "WARNING",
-        "INCOMPLETE",
-        "UNVERIFIED",
-    }
+    hit_address = address_status in {"ERROR", "WARNING"}
     should_save = hit_risk or hit_address
 
     return should_save, risk_level, address_status
