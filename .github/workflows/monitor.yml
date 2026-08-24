@@ -2,32 +2,32 @@ name: Shopify Risk Monitor Automated Task
 
 on:
   schedule:
-    # 每 10 分钟自动运行一次（采用 UTC 时间 Cron 表达式）
-    - cron: '*/10 * * * *'
-  workflow_dispatch: # 支持手动点击按钮触发运行
+    - cron: '*/10 * * * *'  # 每 10 分钟自动定时巡检
+  workflow_dispatch:        # 支持在 GitHub 界面或 API 手动触发
+  repository_dispatch:      # 支持外部 Webhook (如 cron-job.org) 触发
+    types: [cron_trigger]
 
 jobs:
-  run-monitor:
+  run-inspection:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v4
+      - name: 检出项目代码
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: 安装 Python 依赖包
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Create stores.json from Secret
-      run: |
-        echo '${{ secrets.STORES_JSON }}' > stores.json
-
-    - name: Run Shopify Risk Monitor Script
-      run: |
-        python main.py
+      - name: 执行多店铺风控巡检
+        env:
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+        run: |
+          python main.py
