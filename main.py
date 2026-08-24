@@ -32,7 +32,6 @@ BASE_DIR = Path(__file__).resolve().parent
 STORES_FILE = BASE_DIR / "stores.json"
 DB_FILE = BASE_DIR / "orders.db"
 API_VERSION = "2026-07"
-HOURS_BACK = 48
 MAX_WORKERS = 10
 
 # 优先读取环境变量中的 GAS_WEBHOOK_URL，若未设置则使用默认 Webhook 地址
@@ -61,34 +60,6 @@ ADDR_MAP_CN = {
     "CORRECTED": "地址已修正",
 }
 
-ORDERS_GQL = """
-query RecentOrders($query: String!, $cursor: String) {
-  orders(first: 50, query: $query, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
-    edges {
-      node {
-        name
-        createdAt
-        updatedAt
-        riskLevel
-        tags
-        risk {
-          assessments {
-            riskLevel
-          }
-        }
-        shippingAddress {
-          validationResultSummary
-        }
-      }
-    }
-  }
-}
-"""
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -99,12 +70,6 @@ logger = logging.getLogger(__name__)
 
 def log(msg: str) -> None:
     logger.info("[%s] %s", datetime.now(timezone.utc).strftime("%H:%M:%S"), msg)
-
-
-def build_shopify_query(hours: int = HOURS_BACK) -> str:
-    """构建 Shopify GraphQL 巡检时间范围查询"""
-    time_threshold = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return f"updated_at:>{time_threshold}"
 
 
 def format_utc_time(iso_str: str) -> str:
@@ -167,7 +132,7 @@ def upsert_risk_order(
 
 
 # ---------------------------------------------------------------------------
-# Shopify API Token 动态管理与 GraphQL 请求
+# Shopify API Token 动态管理
 # ---------------------------------------------------------------------------
 
 _token_cache: dict[str, dict[str, float | str]] = {}
@@ -183,7 +148,9 @@ def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
         with stores_path.open(encoding="utf-8") as f:
             data = json.load(f)
     else:
-        raise FileNotFoundError(f"未找到店铺配置！请配置 GitHub Secret 'STORES_JSON' 或在根目录提供 '{stores_path.name}' 文件。")
+        raise FileNotFoundError(
+            f"未找到店铺配置！请配置 GitHub Secret 'STORES_JSON' 或在根目录提供 '{stores_path.name}' 文件。"
+        )
 
     stores: list[dict[str, str]] = []
     for idx, item in enumerate(data, start=1):
@@ -195,7 +162,7 @@ def load_stores(stores_path: Path = STORES_FILE) -> list[dict[str, str]]:
             "name": name,
             "domain": domain,
             "client_id": client_id,
-            "client_secret": client_secret
+            "client_secret": client_secret,
         })
     return stores
 
@@ -241,49 +208,108 @@ def get_access_token(store: dict[str, str]) -> str:
     return fetch_access_token(domain, store["client_id"], store["client_secret"])
 
 
-def shopify_graphql(domain: str, token: str, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-    url = f"https://{domain}/admin/api/{API_VERSION}/graphql.json"
-    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": token}
-    payload: dict[str, Any] = {"query": query}
-    if variables:
-        payload["variables"] = variables
+# ---------------------------------------------------------------------------
+# REST API 全量订单拉取（替换原 GraphQL fetch_recent_orders）
+# ---------------------------------------------------------------------------
 
-    for attempt in range(1, 4):
+
+def get_all_orders_from_shopify(
+    shop_domain: str, access_token: str
+) -> list[dict]:
+    """全量获取店铺近 30 天内的所有订单（不限状态、自动分页、防漏单）"""
+    all_orders = []
+
+    # 1. 计算 UTC 时间 30 天前的起始时间点
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    updated_at_min = thirty_days_ago.isoformat()
+
+    # 2. 构建 API URL：包含 status=any, limit=250, updated_at_min
+    url = (
+        f"https://{shop_domain}/admin/api/{API_VERSION}/orders.json"
+        f"?status=any&limit=250&updated_at_min={updated_at_min}"
+    )
+    headers = {"X-Shopify-Access-Token": access_token}
+
+    while url:
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
+            response = requests.get(url, headers=headers, timeout=15, verify=False)
+
+            # 遇到 Shopify API 限流（429）时自动挂起重试
+            if response.status_code == 429:
+                retry_after = float(response.headers.get("Retry-After", 2.0))
+                log(f"⚠️  触发限流，{retry_after}s 后重试 ({shop_domain})")
+                time.sleep(retry_after)
+                continue
+
             response.raise_for_status()
-            body = response.json()
-            if body.get("errors"):
-                raise RuntimeError(f"GraphQL 错误: {body['errors']}")
-            return body.get("data") or {}
-        except requests.RequestException as exc:
-            if attempt < 3:
-                time.sleep(2)
-            else:
-                raise exc
+            data = response.json()
+            orders = data.get("orders", [])
+            all_orders.extend(orders)
+
+            # 解析 Link 响应头，获取下一页游标
+            link_header = response.headers.get("Link")
+            url = None
+            if link_header:
+                for match in link_header.split(","):
+                    if 'rel="next"' in match:
+                        url = match.split(";")[0].strip("<> ")
+                        break
+
+            time.sleep(0.3)  # 平抑并发频率，保护 API 额度
+
+        except Exception as e:
+            log(f"❌ 获取店铺 {shop_domain} 订单失败: {e}")
+            break
+
+    return all_orders
 
 
-def highest_risk_level(node: dict[str, Any]) -> str:
-    direct_level = str(node.get("riskLevel") or "NONE").upper()
-    risk = node.get("risk") or {}
-    assessments = risk.get("assessments") or []
+# ---------------------------------------------------------------------------
+# 风险评估逻辑（适配 REST API 响应字段）
+# ---------------------------------------------------------------------------
 
+
+def highest_risk_level(order: dict[str, Any]) -> str:
+    """
+    REST API 订单风险字段：
+      - order["risks"] 若已通过 fields 参数拉取，则为列表；
+        常规 orders.json 不返回 risks，需单独请求 /orders/{id}/risks.json。
+      - 此处优先读取 order 顶层 "risk_level"（部分店铺计划可见），
+        兜底为 "NONE"。
+    """
+    # 部分 Shopify 计划在订单对象中直接暴露 risk_level
+    direct_level = str(order.get("risk_level") or "NONE").upper()
+    best_score = RISK_PRIORITY.get(direct_level, 0)
     best = direct_level
-    best_score = RISK_PRIORITY.get(best, 0)
 
-    for item in assessments:
-        level = str(item.get("riskLevel") or "NONE").upper()
-        score = RISK_PRIORITY.get(level, 0)
+    # 若已随订单返回 risks 列表（需开启对应字段权限）
+    risks = order.get("risks") or []
+    for risk in risks:
+        level = str(risk.get("recommendation") or "NONE").upper()
+        # REST risks.recommendation: "cancel" → HIGH, "investigate" → MEDIUM, "accept" → LOW
+        level_mapped = {
+            "CANCEL": "HIGH",
+            "INVESTIGATE": "MEDIUM",
+            "ACCEPT": "LOW",
+        }.get(level, level)
+        score = RISK_PRIORITY.get(level_mapped, 0)
         if score > best_score:
-            best = level
+            best = level_mapped
             best_score = score
+
     return best
 
 
-def evaluate_order(node: dict[str, Any]) -> tuple[bool, str, str]:
-    risk_level = highest_risk_level(node)
-    shipping = node.get("shippingAddress") or {}
-    address_status = str(shipping.get("validationResultSummary") or "").upper()
+def evaluate_order(order: dict[str, Any]) -> tuple[bool, str, str]:
+    """
+    REST API 地址字段：
+      order["shipping_address"]["validation_result_summary"]
+    （需店铺开启地址验证功能，否则字段可能为 None）
+    """
+    risk_level = highest_risk_level(order)
+
+    shipping = order.get("shipping_address") or {}
+    address_status = str(shipping.get("validation_result_summary") or "").upper()
 
     hit_risk = risk_level == "HIGH"
     hit_address = address_status in {"ERROR", "WARNING", "INCOMPLETE", "UNVERIFIED"}
@@ -291,31 +317,6 @@ def evaluate_order(node: dict[str, Any]) -> tuple[bool, str, str]:
     if hit_risk or hit_address:
         return True, risk_level, address_status
     return False, risk_level, address_status
-
-
-def fetch_recent_orders(domain: str, token: str) -> list[dict[str, Any]]:
-    orders: list[dict[str, Any]] = []
-    cursor: str | None = None
-    query_str = build_shopify_query(HOURS_BACK)
-
-    while True:
-        variables = {"query": query_str, "cursor": cursor}
-        data = shopify_graphql(domain, token, ORDERS_GQL, variables)
-
-        orders_conn = data.get("orders") or {}
-        edges = orders_conn.get("edges") or []
-        for edge in edges:
-            node = edge.get("node")
-            if node:
-                orders.append(node)
-
-        page_info = orders_conn.get("pageInfo") or {}
-        if page_info.get("hasNextPage"):
-            cursor = page_info.get("endCursor")
-        else:
-            break
-
-    return orders
 
 
 def build_reason(risk_level: str, address_status: str) -> str:
@@ -328,7 +329,7 @@ def build_reason(risk_level: str, address_status: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets 批量同步 (含秘钥动态推送与网络重试机制)
+# Google Sheets 批量同步（含密钥动态推送与网络重试机制）
 # ---------------------------------------------------------------------------
 
 
@@ -342,7 +343,12 @@ def sync_to_google_sheets(all_orders_list: list[dict[str, Any]]) -> None:
     rows = []
     for item in all_orders_list:
         created_at_utc = format_utc_time(item["created_at"])
-        tags_str = ", ".join(item.get("tags") or [])
+        tags_raw = item.get("tags") or ""
+        # REST API tags 字段为逗号分隔字符串；GraphQL 为列表，兼容两种格式
+        if isinstance(tags_raw, list):
+            tags_str = ", ".join(tags_raw)
+        else:
+            tags_str = str(tags_raw)
 
         rows.append([
             item["shop_name"],
@@ -403,10 +409,13 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
 
     try:
         token = get_access_token(store)
-        raw_orders = fetch_recent_orders(domain, token)
+        # 使用 REST API 全量拉取替代原 GraphQL 方法
+        raw_orders = get_all_orders_from_shopify(domain, token)
     except Exception as exc:
         log(f"店铺 {name} 处理失败: {exc}")
         return {"store": store, "orders": []}
+
+    log(f"店铺 {name} 共拉取 {len(raw_orders)} 条订单，开始风险评估...")
 
     flagged_orders: list[dict[str, Any]] = []
     for order in raw_orders:
@@ -414,17 +423,19 @@ def check_store_worker(store: dict[str, str]) -> dict[str, Any]:
         if not should_save:
             continue
 
+        # REST API 使用 snake_case 字段名（created_at / name）
         flagged_orders.append({
             "shop_name": name,
             "shop_domain": domain,
             "order_name": str(order.get("name") or ""),
             "risk_level": risk_level,
             "address_status": address_status,
-            "created_at": str(order.get("createdAt") or ""),
+            "created_at": str(order.get("created_at") or ""),   # REST: created_at
             "reason": build_reason(risk_level, address_status),
-            "tags": order.get("tags") or [],
+            "tags": order.get("tags") or "",                    # REST: 逗号字符串
         })
 
+    log(f"店铺 {name} 命中高风险/地址异常订单 {len(flagged_orders)} 条")
     return {"store": store, "orders": flagged_orders}
 
 
