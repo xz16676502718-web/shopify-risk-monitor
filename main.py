@@ -30,10 +30,7 @@ API_VERSION = "2026-07"
 MAX_WORKERS = 10        # 店铺并发数
 ORDER_EVAL_WORKERS = 8  # 单店铺内订单并发评估数
 
-GAS_WEBHOOK_URL = os.getenv(
-    "GAS_WEBHOOK_URL",
-    "https://script.google.com/macros/s/AKfycbwZmUawxHNCYP4w3IDchs-ape2pfTf4Ua9XHhqCv94vh8ur4HyGasvUUx-Rhp3qeyxM/exec",
-)
+GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
 
 RISK_PRIORITY = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0, "PENDING": 0}
 
